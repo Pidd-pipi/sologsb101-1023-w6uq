@@ -358,11 +358,15 @@ export function matchScoreBand(score: number, bandKeys: string[]): boolean {
 
 /* ----------------------------- 拼配候选 ----------------------------- */
 
-/** 按总分由高到低生成拼配候选清单 */
+/**
+ * 按总分由高到低生成拼配候选清单。
+ * 待复评（invalid=true，工艺参数变动后失效）的审评不进入候选，复评保存后自动恢复资格。
+ */
 export function buildBlendCandidates(reviews: Review[], batches: Batch[], gardens: Garden[]): BlendCandidate[] {
   const batchMap = new Map(batches.map((batch) => [batch.id, batch]));
   const gardenMap = new Map(gardens.map((garden) => [garden.id, garden]));
   return reviews
+    .filter((review) => !review.invalid)
     .filter((review) => batchMap.has(review.batchId))
     .map((review) => {
       const batch = batchMap.get(review.batchId) as Batch;

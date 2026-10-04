@@ -8,13 +8,14 @@ import {
   ID_PREFIX,
   countAll,
   createId,
+  archiveGarden,
   listBatches,
   listGardens,
   listReviews,
   nowIso,
   putGarden,
-  removeGarden as removeGardenRow,
 } from '../utils/db';
+import type { ArchivePackage } from '../types/archive';
 import { averageScore, roundTo } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedIncludes, pickedSelect, type FilterValue } from '../components/common/FilterBar';
 
@@ -57,7 +58,8 @@ interface GardenStoreState {
   selectGarden: (gardenId: string | null) => void;
   createGarden: (draft: GardenDraft) => Promise<Garden>;
   updateGarden: (gardenId: string, draft: GardenDraft) => Promise<void>;
-  deleteGarden: (gardenId: string) => Promise<void>;
+  /** 移走山场：山场本体 + 批次 + 六表关联记录整包入回收区（可恢复） */
+  archiveGarden: (gardenId: string) => Promise<ArchivePackage>;
 }
 
 /** 依据山场 / 批次 / 审评计算指标 */
@@ -181,10 +183,11 @@ export const useGardenStore = create<GardenStoreState>((set, get) => ({
     await get().loadGardens();
   },
 
-  async deleteGarden(gardenId) {
-    await removeGardenRow(gardenId);
+  async archiveGarden(gardenId) {
+    const pkg = await archiveGarden(gardenId);
     if (get().currentGardenId === gardenId) set({ currentGardenId: null });
     await get().loadGardens();
+    return pkg;
   },
 }));
 

@@ -30,7 +30,7 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { useGardenStore } from '../stores/gardenStore';
 import { filterFixes, useBatchStore } from '../stores/batchStore';
-import { db } from '../utils/db';
+import { db, invalidateReviewsForBatches } from '../utils/db';
 import { FIX_LIMITS, ROLL_PRESSURE_OPTIONS, type Fix, type FixDraft } from '../types/fix';
 import { batchLabel, judgeFixLevel, roundTo } from '../utils/tea';
 
@@ -44,6 +44,7 @@ export default function FixRecord() {
   const setFixFilters = useBatchStore((state) => state.setFixFilters);
   const resetFixFilters = useBatchStore((state) => state.resetFixFilters);
   const markBatchState = useBatchStore((state) => state.markBatchState);
+  const saveFix = useBatchStore((state) => state.saveFix);
   const loadBatches = useBatchStore((state) => state.loadBatches);
 
   const fixesTable = useIdbTable<Fix>(db.fixes, { prefix: 'fix', sort: (a, b) => b.createdAt.localeCompare(a.createdAt) });
@@ -117,12 +118,11 @@ export default function FixRecord() {
 
   const submit = async (values: FixDraft): Promise<void> => {
     try {
-      if (editingFix) {
-        await fixesTable.update(editingFix.id, values);
-        message.success('杀青揉捻记录已更新');
-      } else {
-        await fixesTable.create(values);
-        message.success('杀青揉捻记录已登记');
+      // 落库 + 工序回写 + 参数变更审评失效统一在 saveFix 内完成
+      const { affected } = await saveFix(values, editingFix ?? undefined);
+      message.success(editingFix ? '杀青揉捻记录已更新' : '杀青揉捻记录已登记');
+      if (affected > 0) {
+        message.warning(`杀青参数变化，${affected} 条相关审评分与拼配候选已失效，待复评`);
       }
       const nextState = await markBatchState(values.batchId, '已杀青');
       if (nextState) {
@@ -130,7 +130,7 @@ export default function FixRecord() {
       }
       setModalOpen(false);
       setEditingFix(null);
-      await loadBatches();
+      await Promise.all([fixesTable.refresh(), loadBatches()]);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '杀青揉捻记录保存失败');
     }
@@ -147,6 +147,9 @@ export default function FixRecord() {
       onOk: async () => {
         try {
           await fixesTable.remove(fix.id);
+          // 删除杀青记录属于工艺参数变更，相关审评失效待复评
+          const affected = await invalidateReviewsForBatches([fix.batchId], '杀青揉捻记录删除，审评待复评');
+          if (affected > 0) message.warning(`${affected} 条相关审评分与拼配候选已失效，待复评`);
           message.success('记录已删除');
         } catch (error) {
           message.error(error instanceof Error ? error.message : '删除失败');

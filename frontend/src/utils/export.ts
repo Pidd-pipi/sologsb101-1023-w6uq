@@ -11,6 +11,7 @@ import type { Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
 import type { Roast } from '../types/roast';
 import type { Review } from '../types/review';
+import type { ArchivePackage } from '../types/archive';
 import { DB_NAME, DB_VERSION, type DatabaseSnapshot } from './db';
 import { batchLabel, isRatioValid, roundTo } from './tea';
 
@@ -155,6 +156,18 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
   assertRows(raw.fixes, 'fixes');
   assertRows(raw.roasts, 'roasts');
   assertRows(raw.reviews, 'reviews');
+  // 旧版（v2 以前）存档没有回收区与审评失效字段：补齐归档字段，避免导入后缺列
+  const normalizeReview = (row: DatabaseSnapshot['reviews'][number]): DatabaseSnapshot['reviews'][number] => ({
+    ...row,
+    invalid: typeof row.invalid === 'boolean' ? row.invalid : false,
+    invalidReason: typeof row.invalidReason === 'string' ? row.invalidReason : null,
+    invalidatedAt: typeof row.invalidatedAt === 'string' ? row.invalidatedAt : null,
+  });
+  const archives: ArchivePackage[] = Array.isArray(raw.archives)
+    ? (raw.archives as ArchivePackage[]).filter(
+        (pkg) => pkg && typeof pkg.id === 'string' && Array.isArray(pkg.batches),
+      )
+    : [];
   return {
     name: DB_NAME,
     schemaVersion: typeof raw.schemaVersion === 'number' ? raw.schemaVersion : DB_VERSION,
@@ -164,7 +177,8 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
     turns: raw.turns as DatabaseSnapshot['turns'],
     fixes: raw.fixes as DatabaseSnapshot['fixes'],
     roasts: raw.roasts as DatabaseSnapshot['roasts'],
-    reviews: raw.reviews as DatabaseSnapshot['reviews'],
+    reviews: (raw.reviews as DatabaseSnapshot['reviews']).map(normalizeReview),
+    archives,
   };
 }
 

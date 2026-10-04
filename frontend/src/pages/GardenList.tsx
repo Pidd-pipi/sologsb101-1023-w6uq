@@ -5,7 +5,7 @@
  * - 批次登记、工序状态流转、做青时间线预览（消费 useTurnTimeline）
  * - 整库 JSON 导出 / 导入（消费 utils/export）
  */
-import { useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   App,
   Button,
@@ -38,6 +38,8 @@ import FilterBar, { type FilterSelectConfig } from '../components/common/FilterB
 import GradeTag from '../components/common/GradeTag';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
+import ArchiveBin from '../components/archive/ArchiveBin';
+import { useArchiveStore } from '../stores/archiveStore';
 import { useTurnTimeline } from '../hooks/useTurnTimeline';
 import { filterGardens, useGardenStore } from '../stores/gardenStore';
 import { useBatchStore } from '../stores/batchStore';
@@ -55,7 +57,7 @@ import {
   todayIso,
 } from '../utils/tea';
 import { exportSnapshotJson, parseSnapshotJson, readJsonFile } from '../utils/export';
-import { exportSnapshot, importSnapshot } from '../utils/db';
+import { ArchiveQuotaError, exportSnapshot, importSnapshot } from '../utils/db';
 
 export default function GardenList() {
   const { message, modal } = App.useApp();
@@ -70,7 +72,7 @@ export default function GardenList() {
   const resetFilters = useGardenStore((state) => state.resetFilters);
   const createGarden = useGardenStore((state) => state.createGarden);
   const updateGarden = useGardenStore((state) => state.updateGarden);
-  const deleteGarden = useGardenStore((state) => state.deleteGarden);
+  const archiveGardenRow = useGardenStore((state) => state.archiveGarden);
   const loadGardens = useGardenStore((state) => state.loadGardens);
   const currentGardenId = useGardenStore((state) => state.currentGardenId);
   const selectGarden = useGardenStore((state) => state.selectGarden);
@@ -78,7 +80,7 @@ export default function GardenList() {
   const batches = useBatchStore((state) => state.batches);
   const createBatch = useBatchStore((state) => state.createBatch);
   const updateBatch = useBatchStore((state) => state.updateBatch);
-  const deleteBatch = useBatchStore((state) => state.deleteBatch);
+  const archiveBatchRow = useBatchStore((state) => state.archiveBatch);
   const advanceBatchState = useBatchStore((state) => state.advanceBatchState);
   const loadBatches = useBatchStore((state) => state.loadBatches);
   const loadReviews = useBatchStore((state) => state.loadReviews);
@@ -88,6 +90,16 @@ export default function GardenList() {
   const [batchModalOpen, setBatchModalOpen] = useState(false);
   const [editingBatch, setEditingBatch] = useState<Batch | null>(null);
   const [drawerGardenId, setDrawerGardenId] = useState<string | null>(null);
+
+  const refreshArchiveBin = useArchiveStore((state) => state.refresh);
+  useEffect(() => {
+    void refreshArchiveBin();
+  }, [refreshArchiveBin]);
+
+  /** 恢复 / 清理回收区后，同时刷新正式台账与统计 */
+  const handleArchiveChanged = useCallback(async (): Promise<void> => {
+    await Promise.all([loadGardens(), loadBatches(), loadReviews()]);
+  }, [loadBatches, loadGardens, loadReviews]);
 
   const rows = useMemo(() => filterGardens(gardens, filters), [gardens, filters]);
 
@@ -163,19 +175,23 @@ export default function GardenList() {
   const confirmDeleteGarden = (garden: Garden): void => {
     const batchCount = metrics[garden.id]?.batchCount ?? 0;
     modal.confirm({
-      title: `删除山场「${garden.name}」？`,
-      content: `将级联删除该山场下的 ${batchCount} 个茶青批次，以及这些批次的做青轮次、杀青揉捻、焙火与审评记录。此操作不可撤销。`,
-      okText: '确认删除',
+      title: `移走山场「${garden.name}」到回收区？`,
+      content: `该山场下的 ${batchCount} 个茶青批次，以及做青轮次、杀青揉捻、焙火、审评等关联记录会整包移入回收区，保留原顺序与引用，可随时恢复；不会再用整库备份覆盖新数据。`,
+      okText: '移入回收区',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
         try {
-          await deleteGarden(garden.id);
+          const pkg = await archiveGardenRow(garden.id);
           await Promise.all([loadBatches(), loadReviews()]);
           if (drawerGardenId === garden.id) setDrawerGardenId(null);
-          message.success('山场及其关联工序记录已删除');
+          message.success(`已移入回收区（${pkg.detailCount} 条明细），需要时可在页面下方回收区恢复`);
         } catch (error) {
-          message.error(error instanceof Error ? error.message : '删除失败');
+          if (error instanceof ArchiveQuotaError) {
+            message.error(`${error.message}，已取消本次移入，正式数据未改动`);
+          } else {
+            message.error(error instanceof Error ? error.message : '移入回收区失败');
+          }
         }
       },
     });
@@ -226,18 +242,22 @@ export default function GardenList() {
 
   const confirmDeleteBatch = (batch: Batch, gardenName: string): void => {
     modal.confirm({
-      title: `删除批次「${batchLabel(batch, gardenName)}」？`,
-      content: '将级联删除该批次的做青轮次、杀青揉捻、焙火道次与审评记录。',
-      okText: '确认删除',
+      title: `移走批次「${batchLabel(batch, gardenName)}」到回收区？`,
+      content: '该批次的做青轮次、杀青揉捻、焙火道次与审评记录会整包移入回收区，保留原顺序与引用，可随时恢复。',
+      okText: '移入回收区',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
         try {
-          await deleteBatch(batch.id);
+          const pkg = await archiveBatchRow(batch.id);
           await loadGardens();
-          message.success('批次及其工序记录已删除');
+          message.success(`已移入回收区（${pkg.detailCount} 条明细），需要时可在回收区恢复`);
         } catch (error) {
-          message.error(error instanceof Error ? error.message : '删除失败');
+          if (error instanceof ArchiveQuotaError) {
+            message.error(`${error.message}，已取消本次移入，正式数据未改动`);
+          } else {
+            message.error(error instanceof Error ? error.message : '移入回收区失败');
+          }
         }
       },
     });
@@ -306,7 +326,7 @@ export default function GardenList() {
             编辑
           </Button>
           <Button size="small" type="link" danger onClick={() => confirmDeleteBatch(batch, detailGarden?.name ?? '')}>
-            删除
+            移走
           </Button>
         </Space>
       ),
@@ -428,7 +448,7 @@ export default function GardenList() {
                       编辑
                     </Button>,
                     <Button key="del" type="link" danger icon={<DeleteOutlined />} onClick={() => confirmDeleteGarden(garden)}>
-                      删除
+                      移走
                     </Button>,
                   ]}
                 >
@@ -461,6 +481,10 @@ export default function GardenList() {
           })}
         </Row>
       )}
+
+      <div style={{ marginTop: 18 }}>
+        <ArchiveBin onChanged={() => void handleArchiveChanged()} />
+      </div>
 
       {/* ------------------------------ 山场详情抽屉 ------------------------------ */}
       <Drawer

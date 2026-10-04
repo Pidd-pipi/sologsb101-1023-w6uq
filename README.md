@@ -37,12 +37,12 @@ docker compose up -d --build
 
 | 路由 | 模块 | 说明 |
 | --- | --- | --- |
-| `/gardens` | 山场与茶青批次台账 | 建山场（品种 / 土壤 / 海拔 / 朝向），卡片回显批次数、鲜叶合计与审评均分；登记批次并推进工序状态；整库 JSON 导出 / 导入 |
+| `/gardens` | 山场与茶青批次台账 | 建山场（品种 / 土壤 / 海拔 / 朝向），卡片回显批次数、鲜叶合计与审评均分；登记批次并推进工序状态；**移走山场 / 批次入回收区（可恢复，容量 300 条明细，冲突不覆盖、列新旧工艺取舍）**；整库 JSON 导出 / 导入 |
 | `/turns` | 做青轮次编排 | 摇青 / 静置交替时间线与累计时长、失水率走势；**HTML5 原生拖拽排序**写回 `roundNo`；复制上一轮参数后微调、参数模板存 / 套用 |
 | `/fixing` | 杀青揉捻记录 | 锅温、杀青时长、揉捻压力与时长、操作人登记；登记后自动把批次回写为「已杀青」 |
 | `/roasting` | 焙火曲线与复焙安排 | 多道次按序排列（上移 / 下移写回 `passNo`）、足火判定（轻火 / 中火 / 足火）、复焙提醒（逾期 / 今日 / 7 日内 / 已排期） |
-| `/reviews` | 毛茶审评 | 香气 30% / 汤色 20% / 滋味 35% / 叶底 15% 加权换算总分，按总分排序并生成拼配候选清单 |
-| `/blending` | 拼配方案登记与结构版本导出 | 按总分组合批次与占比、**占比校验（合计必须 100%）**、方案 JSON 与整库结构版本 JSON 导出 |
+| `/reviews` | 毛茶审评 | 香气 30% / 汤色 20% / 滋味 35% / 叶底 15% 加权换算总分，按总分排序并生成拼配候选清单；做青 / 杀青 / 焙火参数变更后相关审评自动置「待复评」、退出候选，复评保存恢复 |
+| `/blending` | 拼配方案登记与结构版本导出 | 按总分组合批次与占比、**占比校验（合计必须 100%）**、方案 JSON 与整库结构版本 JSON 导出；待复评批次不进入候选清单 |
 
 批次工序状态按工序自动流转：**做青中 → 已杀青 → 已焙火 → 已审评**（只向后推进，不回退）。
 
@@ -103,24 +103,23 @@ sologsb101-1023/
         │   ├── turn.ts             # 做青轮次：batchId / roundNo / shakeMin / restMin / roomTempC / humidityPct / waterLossPct
         │   ├── fix.ts              # 杀青揉捻：batchId / wokTempC / fixMin / rollPressure / rollMin / operator
         │   ├── roast.ts            # 焙火：batchId / passNo / tempC / hours / charcoal / nextRoastDate / state
-        │   └── review.ts           # 审评：batchId / reviewedAt / aroma / liquorColor / taste / leafBase / totalScore / blendNote
+        │   └── review.ts           # 审评：batchId / reviewedAt / 四项分 / totalScore / blendNote / invalid 待复评失效
         ├── stores/                 # Zustand：跨页状态全部放这里
-        │   ├── gardenStore.ts      # 山场列表、派生指标、当前选中山场、筛选条件
-        │   ├── batchStore.ts       # 批次与工序流转、杀青/审评/拼配筛选、拼配方案草稿
-        │   ├── turnStore.ts        # 当前批次轮次、参数模板、拖拽重排（写回 roundNo）
-        │   └── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定
-        ├── components/common/      # 共享组件
-        │   ├── GradeTag.tsx        # 嫩度 / 火功 / 评分 / 工序状态 / 焙火状态 / 揉捻压力标签
-        │   ├── FilterBar.tsx       # 关键字 + 多个下拉多选，并同步 URL query
-        │   ├── StatBadge.tsx       # 统计徽标（累计时长、失水率、均分、热负荷…）
-        │   └── EmptyPanel.tsx      # 空数据引导 + 主/次操作按钮
+        │   ├── gardenStore.ts      # 山场列表、派生指标、当前选中山场、筛选、移山场入回收区
+        │   ├── batchStore.ts       # 批次与工序流转、杀青/审评/拼配筛选、杀青落库联动失效、拼配草稿、移批次入回收区
+        │   ├── turnStore.ts        # 当前批次轮次、参数模板、拖拽重排（写回 roundNo）、参数变更联动审评失效
+        │   ├── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定、焙火参数变更联动审评失效
+        │   └── archiveStore.ts     # 回收区归档包列表 / 容量 / 恢复预检与取舍 / 清理
+        ├── components/
+        │   ├── common/             # GradeTag / FilterBar / StatBadge / EmptyPanel
+        │   └── archive/ArchiveBin.tsx # 回收区面板：容量进度、恢复冲突新旧工艺取舍、清理
         ├── hooks/
         │   ├── useTurnTimeline.ts  # 轮次累计摇青/静置时长、交替时间线段、失水率走势
         │   └── useIdbTable.ts      # Dexie 表响应式订阅 + 增删改查封装
         ├── utils/
-        │   ├── tea.ts              # 嫩度/火功枚举映射、温湿度与失水率区间判定、评分加权换算、拼配候选
-        │   ├── db.ts               # Dexie 实例、六张表、version(1) + version(2) 迁移、播种、快照导入导出
-        │   └── export.ts           # 批次工艺记录 / 整库存档 / 拼配方案 JSON 导出与校验
+        │   ├── tea.ts              # 嫩度/火功枚举映射、温湿度与失水率区间判定、评分加权换算、拼配候选（排除待复评）
+        │   ├── db.ts               # Dexie 实例、七张表、version(1/2/3) 迁移、播种、回收区归档/恢复、审评失效、快照导入导出
+        │   └── export.ts           # 批次工艺记录 / 整库存档 / 拼配方案 JSON 导出与校验（兼容旧版存档）
         ├── pages/                  # 六个页面，与路由一一对应
         │   ├── GardenList.tsx      # /gardens
         │   ├── TurnBoard.tsx       # /turns
@@ -136,13 +135,18 @@ sologsb101-1023/
 ## 六、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbtearock`（`src/utils/db.ts` 中的 `DB_NAME`）
-- **结构版本号**：`DB_VERSION = 2`
+- **结构版本号**：`DB_VERSION = 3`
   - `version(1)` 初版结构：六张分表的最小索引
   - `version(2).stores(...)` 补齐外键 / 状态 / 日期索引，并 `.upgrade()` **真实迁移历史数据**：补齐 `createdAt` / `updatedAt`、山场补齐朝向与土壤品种兜底值、批次工序状态归一化、轮次与焙火数值截断到合法区间、审评总分由「四项简单平均」改为「分项加权换算」后重算。
-- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`（每条记录都有 `id` / `createdAt` / `updatedAt`）
-- **首屏自动播种**：`initDatabase()` 中 `if ((await db.gardens.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据 —— 3 个山场 → 4 个茶青批次 → 每个批次下 2-3 条做青轮次、1 条杀青揉捻、1-2 道焙火、1 条审评，父→子→孙贯通；播种使用固定 id + `bulkPut`，**幂等**，重复执行不会产生重复行。
-- **级联删除**：删除山场会级联删除其批次与批次下的轮次 / 杀青 / 焙火 / 审评；删除批次会级联删除其全部工序子表（均使用 `db.transaction`）。
-- **导出 / 导入**：山场页支持「导出整库 JSON / 导入 JSON」（Blob + `URL.createObjectURL` + `a.download`，导入前做结构与库名校验，校验失败弹错误提示）；拼配页支持拼配方案 JSON 与整库结构版本 JSON 导出。
+  - `version(3)` 新增 **回收区 `archives` 表**（可恢复归档）与审评 **待复评失效字段**（`invalid` / `invalidReason` / `invalidatedAt`）。旧库升级时：① IndexedDB 对「只加字段」不自动重写已有行，因此 `initDatabase()` 内置幂等补齐，历史审评默认有效；② 导入旧版（v2）整库存档自动补空 `archives` 与 `invalid=false`。
+- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`（每条记录都有 `id` / `createdAt` / `updatedAt`）+ 回收区 `archives`
+- **首屏自动播种**：`initDatabase()` 中六张正式表与回收区都为空才播种（避免把全部数据移入回收区后刷新又灌演示数据），播种 3 层互相引用的演示数据 —— 3 个山场 → 4 个茶青批次 → 每个批次下 2-3 条做青轮次、1 条杀青揉捻、1-2 道焙火、1 条审评，父→子→孙贯通；播种使用固定 id + `bulkPut`，**幂等**，重复执行不会产生重复行。
+- **可恢复归档（回收区）**：山场 / 批次页的「移走」不再硬删，而是在**单个 Dexie 事务**内把主体连同六个工序表的关联记录整包写入 `archives` 再从正式表移除，保留做青 `roundNo` / 焙火 `passNo` 原顺序与 `gardenId` / `batchId` 引用。
+  - **容量上限 300 条明细**（山场包含山场行 + 批次 + 轮次 + 杀青 + 焙火 + 审评），满后抛 `ArchiveQuotaError` 拒绝新移入并提示清理；事务保证容量不足时正式数据不丢、回收区不产生半包。
+  - **恢复**：`planRestore()` 预检同编号（同 id）冲突。无冲突整包写回；有冲突**默认不覆盖现有记录**，弹窗逐行列出「现有（新）/ 归档（旧）」关键工艺供人取舍（保留现有 / 用归档覆盖）。写回与回收区删除在同一事务，**中途失败回滚到操作前**，回收区与正式数据都可继续处理。
+  - **清理**：可彻底删除单个归档包或清空回收区以腾容量。
+- **工艺变更 → 审评失效待复评**：做青轮次新增 / 改参数 / 删除、杀青揉捻参数变更或删除、焙火道次新增 / 温时炭参数变更 / 删除，会把相关批次已有审评置为 `invalid=true`（仅改复焙日期、焙火状态或轮次 / 道次顺序不失效）。失效审评从**拼配候选清单剔除**，审评页与拼配页提示待复评；重新登记 / 复评保存即清除失效、恢复候选资格。
+- **导出 / 导入**：山场页支持「导出整库 JSON / 导入 JSON」（Blob + `URL.createObjectURL` + `a.download`，导入前做结构与库名校验，旧版存档自动补齐 v3 字段，回收区随整库一并导出 / 导入）；拼配页支持拼配方案 JSON 与整库结构版本 JSON 导出。
 - **无命名卷、无数据库服务**：容器只托管静态文件，数据完全存在浏览器本地，换浏览器或清空站点数据即清空。
 
 ---

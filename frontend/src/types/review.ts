@@ -48,6 +48,15 @@ export interface Review {
   totalScore: number;
   /** 拼配去向，例如「拼配方案 A · 40%」 */
   blendNote: string;
+  /**
+   * 是否待复评：做青 / 杀青 / 焙火参数变化后置为 true，
+   * 审评分与拼配候选随之失效，重新登记 / 复评保存后清空。
+   */
+  invalid: boolean;
+  /** 失效原因（做青参数调整 / 杀青揉捻参数调整 / 焙火参数调整 / 做青轮次删除…），未失效为 null */
+  invalidReason: string | null;
+  /** 最近一次失效时间 ISO，未失效为 null */
+  invalidatedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }

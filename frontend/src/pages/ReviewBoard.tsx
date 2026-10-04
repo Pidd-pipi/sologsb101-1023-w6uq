@@ -7,6 +7,7 @@
 import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -82,13 +83,15 @@ export default function ReviewBoard() {
   );
 
   const stats = useMemo(() => {
-    const scores = rows.map((review) => review.totalScore);
-    const candidates = rows.filter((review) => review.totalScore >= BLEND_CANDIDATE_SCORE).length;
+    const validRows = rows.filter((review) => !review.invalid);
+    const scores = validRows.map((review) => review.totalScore);
+    const candidates = validRows.filter((review) => review.totalScore >= BLEND_CANDIDATE_SCORE).length;
     const best = scores.length > 0 ? Math.max(...scores) : 0;
     return {
       average: averageScore(scores),
       best,
       candidates,
+      invalid: rows.filter((review) => review.invalid).length,
       batchCovered: new Set(rows.map((review) => review.batchId)).size,
     };
   }, [rows]);
@@ -154,11 +157,15 @@ export default function ReviewBoard() {
       leafBase: values.leafBase,
       totalScore,
       blendNote: values.blendNote ?? '',
+      // 重新登记 / 复评保存：审评分重新生效，清除待复评标记
+      invalid: false,
+      invalidReason: null,
+      invalidatedAt: null,
     };
     try {
       if (editingReview) {
         await reviewsTable.update(editingReview.id, payload);
-        message.success(`审评记录已更新，加权总分 ${totalScore} 分（${scoreGrade(totalScore)}）`);
+        message.success(`审评记录已更新，加权总分 ${totalScore} 分（${scoreGrade(totalScore)}），恢复拼配候选资格`);
       } else {
         await reviewsTable.create(payload);
         message.success(`审评已登记，加权总分 ${totalScore} 分（${scoreGrade(totalScore)}）`);
@@ -229,9 +236,14 @@ export default function ReviewBoard() {
       width: 200,
       defaultSortOrder: 'descend',
       sorter: (a, b) => a.totalScore - b.totalScore,
-      render: (value: number) => (
+      render: (value: number, row: Review) => (
         <Space size={8}>
           <GradeTag kind="score" value={value} />
+          {row.invalid ? (
+            <Tooltip title={row.invalidReason ?? '工艺参数变动，审评待复评'}>
+              <Tag color="red">已失效</Tag>
+            </Tooltip>
+          ) : null}
           <Progress
             percent={Math.min(100, value)}
             size="small"
@@ -245,9 +257,17 @@ export default function ReviewBoard() {
     {
       title: '拼配候选',
       key: 'candidate',
-      width: 110,
+      width: 120,
       render: (_: unknown, row) =>
-        row.totalScore >= BLEND_CANDIDATE_SCORE ? <Tag color="volcano">候选</Tag> : <Tag>待复评</Tag>,
+        row.invalid ? (
+          <Tooltip title={row.invalidReason ?? '工艺参数变动，审评待复评'}>
+            <Tag color="red">待复评</Tag>
+          </Tooltip>
+        ) : row.totalScore >= BLEND_CANDIDATE_SCORE ? (
+          <Tag color="volcano">候选</Tag>
+        ) : (
+          <Tag>待复评</Tag>
+        ),
     },
     {
       title: '拼配去向',
@@ -317,7 +337,24 @@ export default function ReviewBoard() {
           hint={`总分 ≥ ${BLEND_CANDIDATE_SCORE} 分`}
         />
         <StatBadge label="覆盖批次" value={stats.batchCovered} suffix="个" />
+        <StatBadge
+          label="待复评失效"
+          value={stats.invalid}
+          suffix="条"
+          tone={stats.invalid > 0 ? 'danger' : 'default'}
+          hint="做青 / 杀青 / 焙火参数变动后自动失效，复评保存后恢复"
+        />
       </div>
+
+      {stats.invalid > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${stats.invalid} 条审评分因做青 / 杀青 / 焙火参数变动已失效`}
+          description="这些批次已暂时移出拼配候选清单；请在复评后重新保存审评（分数可原样确认），保存即恢复候选资格。"
+        />
+      ) : null}
 
       <FilterBar
         value={reviewFilters}

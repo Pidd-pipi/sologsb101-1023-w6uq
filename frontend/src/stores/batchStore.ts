@@ -14,18 +14,21 @@ import {
   type BatchStateCounts,
 } from '../types/batch';
 import type { BlendCandidate, Review } from '../types/review';
-import type { Fix } from '../types/fix';
+import type { Fix, FixDraft } from '../types/fix';
 import type { Garden } from '../types/garden';
 import {
   ID_PREFIX,
+  archiveBatch,
   createId,
+  invalidateReviewsForBatches,
   listBatches,
   listFixes,
   listReviews,
   nowIso,
   putBatch,
-  removeBatch as removeBatchRow,
+  putFix,
 } from '../utils/db';
+import type { ArchivePackage } from '../types/archive';
 import { batchLabel, matchScoreBand, roundTo } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedIncludes, pickedSelect, type FilterValue } from '../components/common/FilterBar';
 
@@ -151,7 +154,13 @@ interface BatchStoreState {
   selectBatch: (batchId: string | null) => void;
   createBatch: (draft: BatchDraft) => Promise<Batch>;
   updateBatch: (batchId: string, draft: BatchDraft) => Promise<void>;
-  deleteBatch: (batchId: string) => Promise<void>;
+  /** 移走批次：批次本体 + 六表关联工序记录整包入回收区（可恢复） */
+  archiveBatch: (batchId: string) => Promise<ArchivePackage>;
+  /**
+   * 登记 / 修改杀青揉捻：落库后回写批次为「已杀青」；
+   * 若锅温 / 时长 / 压力等参数发生变化，令该批次已有审评失效待复评，返回失效条数。
+   */
+  saveFix: (draft: FixDraft, existing?: Fix) => Promise<{ affected: number }>;
   /** 推进到下一道工序；已审评返回 null */
   advanceBatchState: (batchId: string) => Promise<BatchState | null>;
   /** 工序回写：仅允许向后推进，不会回退 */
@@ -271,10 +280,51 @@ export const useBatchStore = create<BatchStoreState>((set, get) => ({
     await get().loadBatches();
   },
 
-  async deleteBatch(batchId) {
-    await removeBatchRow(batchId);
+  async archiveBatch(batchId) {
+    const pkg = await archiveBatch(batchId);
     set({ blendDraft: get().blendDraft.filter((item) => item.batchId !== batchId) });
     await Promise.all([get().loadBatches(), get().loadReviews()]);
+    return pkg;
+  },
+
+  async saveFix(draft, existing) {
+    const stamp = nowIso();
+    const row: Fix = existing
+      ? {
+          ...existing,
+          wokTempC: draft.wokTempC,
+          fixMin: draft.fixMin,
+          rollPressure: draft.rollPressure,
+          rollMin: draft.rollMin,
+          operator: draft.operator,
+          updatedAt: stamp,
+        }
+      : {
+          id: createId(ID_PREFIX.fix),
+          batchId: draft.batchId,
+          wokTempC: draft.wokTempC,
+          fixMin: draft.fixMin,
+          rollPressure: draft.rollPressure,
+          rollMin: draft.rollMin,
+          operator: draft.operator,
+          createdAt: stamp,
+          updatedAt: stamp,
+        };
+    await putFix(row);
+
+    // 仅当杀青 / 揉捻参数确实变化时，相关审评分与拼配候选才失效待复评
+    const paramsChanged =
+      !existing ||
+      existing.wokTempC !== draft.wokTempC ||
+      existing.fixMin !== draft.fixMin ||
+      existing.rollMin !== draft.rollMin ||
+      existing.rollPressure !== draft.rollPressure;
+    let affected = 0;
+    if (paramsChanged) {
+      affected = await invalidateReviewsForBatches([draft.batchId], '杀青揉捻参数调整，审评待复评');
+    }
+    await get().loadBatches();
+    return { affected };
   },
 
   async advanceBatchState(batchId) {

@@ -51,6 +51,9 @@ export default function BlendPlan() {
   });
   const [saving, setSaving] = useState(false);
 
+  /** 失效待复评的审评数（不进入候选清单） */
+  const invalidCount = useMemo(() => reviewsTable.rows.filter((review) => review.invalid).length, [reviewsTable.rows]);
+
   const candidates = useMemo(
     () => buildBlendCandidates(reviewsTable.rows, batches, gardens),
     [batches, gardens, reviewsTable.rows],
@@ -274,6 +277,16 @@ export default function BlendPlan() {
         onReset={resetBlendFilters}
         placeholder="搜索山场 / 批次 / 品种"
       />
+
+      {invalidCount > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`${invalidCount} 条审评因做青 / 杀青 / 焙火参数变动失效，已暂时移出拼配候选`}
+          description="请先到「毛茶审评」对相关批次复评并保存，恢复候选资格后再组拼配方案。"
+        />
+      ) : null}
 
       {planItems.length > 0 && validationError ? (
         <Alert type="warning" showIcon style={{ marginBottom: 14 }} message="拼配占比校验未通过" description={validationError} />

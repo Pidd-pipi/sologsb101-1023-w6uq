@@ -162,11 +162,13 @@ export default function TurnBoard() {
     if (!activeBatchId) return;
     try {
       if (editingTurn) {
-        await updateTurn(editingTurn.id, { ...values, batchId: activeBatchId });
+        const { affected } = await updateTurn(editingTurn.id, { ...values, batchId: activeBatchId });
         message.success(`第 ${editingTurn.roundNo} 轮参数已更新`);
+        if (affected > 0) message.warning(`${affected} 条相关审评分与拼配候选已失效，待复评`);
       } else {
-        const created = await createTurn({ ...values, batchId: activeBatchId });
+        const { turn: created, affected } = await createTurn({ ...values, batchId: activeBatchId });
         message.success(`已新增第 ${created.roundNo} 轮做青参数`);
+        if (affected > 0) message.warning(`${affected} 条相关审评分与拼配候选已失效，待复评`);
       }
       setModalOpen(false);
       setEditingTurn(null);
@@ -178,14 +180,15 @@ export default function TurnBoard() {
   const confirmDelete = (turn: Turn): void => {
     modal.confirm({
       title: `删除第 ${turn.roundNo} 轮？`,
-      content: '删除后其余轮次会自动重排 roundNo，做青时间线与累计时长随之更新。',
+      content: '删除后其余轮次会自动重排 roundNo，做青时间线与累计时长随之更新；该批次已有审评会失效待复评。',
       okText: '确认删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
         try {
-          await deleteTurn(turn.id);
+          const { affected } = await deleteTurn(turn.id);
           message.success('轮次已删除并重排');
+          if (affected > 0) message.warning(`${affected} 条相关审评分与拼配候选已失效，待复评`);
         } catch (error) {
           message.error(error instanceof Error ? error.message : '删除失败');
         }

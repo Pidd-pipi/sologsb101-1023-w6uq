@@ -5,7 +5,7 @@
  */
 import { create } from 'zustand';
 import { TURN_LIMITS, type Turn, type TurnDraft, type TurnTemplate } from '../types/turn';
-import { ID_PREFIX, createId, listTurnsByBatch, nowIso, putTurn, putTurns, removeTurn } from '../utils/db';
+import { ID_PREFIX, createId, invalidateReviewsForBatches, listTurnsByBatch, nowIso, putTurn, putTurns, removeTurn } from '../utils/db';
 import { roundTo } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedSelect, type FilterValue } from '../components/common/FilterBar';
 
@@ -107,9 +107,10 @@ interface TurnStoreState {
   setActiveBatch: (batchId: string) => Promise<void>;
   setFilters: (filters: FilterValue) => void;
   resetFilters: () => void;
-  createTurn: (draft: TurnDraft) => Promise<Turn>;
-  updateTurn: (turnId: string, draft: TurnDraft) => Promise<void>;
-  deleteTurn: (turnId: string) => Promise<void>;
+  /** 参数变更（新增/改/删）后返回受影响而失效待复评的审评条数，供页面提示 */
+  createTurn: (draft: TurnDraft) => Promise<{ turn: Turn; affected: number }>;
+  updateTurn: (turnId: string, draft: TurnDraft) => Promise<{ affected: number }>;
+  deleteTurn: (turnId: string) => Promise<{ affected: number }>;
   copyPreviousTurn: (batchId?: string) => Promise<Turn | null>;
   saveTemplate: (turn: Turn) => void;
   applyTemplate: (turnId: string) => Promise<void>;
@@ -171,12 +172,20 @@ export const useTurnStore = create<TurnStoreState>((set, get) => ({
     };
     await putTurn(row);
     await get().loadTurns(draft.batchId);
-    return row;
+    // 新增做青轮次属于工艺参数变更，相关审评失效待复评
+    const affected = await invalidateReviewsForBatches([draft.batchId], '做青轮次新增，审评待复评');
+    return { turn: row, affected };
   },
 
   async updateTurn(turnId, draft) {
     const existing = get().turns.find((turn) => turn.id === turnId);
-    if (!existing) return;
+    if (!existing) return { affected: 0 };
+    const paramsChanged =
+      existing.shakeMin !== draft.shakeMin ||
+      existing.restMin !== draft.restMin ||
+      existing.roomTempC !== draft.roomTempC ||
+      existing.humidityPct !== draft.humidityPct ||
+      existing.waterLossPct !== draft.waterLossPct;
     const next: Turn = {
       ...existing,
       shakeMin: draft.shakeMin,
@@ -188,13 +197,21 @@ export const useTurnStore = create<TurnStoreState>((set, get) => ({
     };
     await putTurn(next);
     await get().loadTurns(existing.batchId);
+    // 仅参数真的变了才令审评失效；仅切换顺序 / 不改参数不影响审评
+    const affected = paramsChanged
+      ? await invalidateReviewsForBatches([existing.batchId], '做青参数调整，审评待复评')
+      : 0;
+    return { affected };
   },
 
   async deleteTurn(turnId) {
     const existing = get().turns.find((turn) => turn.id === turnId);
-    if (!existing) return;
+    if (!existing) return { affected: 0 };
+    const batchId = existing.batchId;
     await removeTurn(turnId);
-    await get().renumber(existing.batchId);
+    const affected = await invalidateReviewsForBatches([batchId], '做青轮次删除，审评待复评');
+    await get().renumber(batchId);
+    return { affected };
   },
 
   async copyPreviousTurn(batchId) {
@@ -203,7 +220,8 @@ export const useTurnStore = create<TurnStoreState>((set, get) => ({
     const turns = await listTurnsByBatch(target);
     const previous = turns[turns.length - 1];
     const draft = previous ? tweakFromPrevious(previous) : defaultTurnDraft(target);
-    return get().createTurn(draft);
+    const { turn } = await get().createTurn(draft);
+    return turn;
   },
 
   saveTemplate(turn) {

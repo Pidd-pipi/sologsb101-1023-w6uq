@@ -173,11 +173,13 @@ export default function RoastPlan() {
   const submit = async (values: RoastDraft): Promise<void> => {
     try {
       if (editingRoast) {
-        await updateRoast(editingRoast.id, values);
+        const { affected } = await updateRoast(editingRoast.id, values);
         message.success(`第 ${editingRoast.passNo} 道焙火已更新`);
+        if (affected > 0) message.warning(`焙火参数变化，${affected} 条相关审评分与拼配候选已失效，待复评`);
       } else {
-        const created = await createRoast(values);
+        const { roast: created, affected } = await createRoast(values);
         message.success(`已新增第 ${created.passNo} 道焙火`);
+        if (affected > 0) message.warning(`${affected} 条相关审评分与拼配候选已失效，待复评`);
       }
       setModalOpen(false);
       setEditingRoast(null);
@@ -189,14 +191,15 @@ export default function RoastPlan() {
   const confirmDelete = (roast: Roast): void => {
     modal.confirm({
       title: `删除第 ${roast.passNo} 道焙火？`,
-      content: `批次：${labelOfBatch(roast.batchId)}。删除后同批次其余道次会重排 passNo。`,
+      content: `批次：${labelOfBatch(roast.batchId)}。删除后同批次其余道次会重排 passNo；该批次已有审评会失效待复评。`,
       okText: '确认删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
         try {
-          await deleteRoast(roast.id);
+          const { affected } = await deleteRoast(roast.id);
           message.success('焙火道次已删除并重排');
+          if (affected > 0) message.warning(`${affected} 条相关审评分与拼配候选已失效，待复评`);
         } catch (error) {
           message.error(error instanceof Error ? error.message : '删除失败');
         }

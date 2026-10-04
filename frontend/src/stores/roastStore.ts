@@ -9,6 +9,7 @@ import type { Garden } from '../types/garden';
 import {
   ID_PREFIX,
   createId,
+  invalidateReviewsForBatches,
   listRoasts,
   listRoastsByBatch,
   nowIso,
@@ -54,9 +55,10 @@ interface RoastStoreState {
   loadRoasts: () => Promise<void>;
   setFilters: (filters: FilterValue) => void;
   resetFilters: () => void;
-  createRoast: (draft: RoastDraft) => Promise<Roast>;
-  updateRoast: (roastId: string, draft: RoastDraft) => Promise<void>;
-  deleteRoast: (roastId: string) => Promise<void>;
+  /** 焙火参数变更（新增/改/删）后返回失效待复评的审评条数 */
+  createRoast: (draft: RoastDraft) => Promise<{ roast: Roast; affected: number }>;
+  updateRoast: (roastId: string, draft: RoastDraft) => Promise<{ affected: number }>;
+  deleteRoast: (roastId: string) => Promise<{ affected: number }>;
   /** 状态流转：待焙 → 焙火中 → 已足火；足火后自动把批次回写为「已焙火」 */
   advanceRoastState: (roastId: string) => Promise<RoastState | null>;
   /** 道次上移 / 下移（写回 passNo） */
@@ -106,12 +108,17 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
     };
     await putRoast(row);
     await get().loadRoasts();
-    return row;
+    // 新增焙火道次属于焙火参数变更，相关审评失效待复评
+    const affected = await invalidateReviewsForBatches([draft.batchId], '焙火道次新增，审评待复评');
+    return { roast: row, affected };
   },
 
   async updateRoast(roastId, draft) {
     const existing = get().roasts.find((roast) => roast.id === roastId);
-    if (!existing) return;
+    if (!existing) return { affected: 0 };
+    // 仅温度 / 时长 / 炭种这类焙火参数变化才失效审评；只改复焙日期或状态不失效
+    const paramsChanged =
+      existing.tempC !== draft.tempC || existing.hours !== draft.hours || existing.charcoal !== draft.charcoal;
     const next: Roast = {
       ...existing,
       tempC: draft.tempC,
@@ -123,17 +130,24 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
     };
     await putRoast(next);
     await get().loadRoasts();
+    const affected = paramsChanged
+      ? await invalidateReviewsForBatches([existing.batchId], '焙火参数调整，审评待复评')
+      : 0;
+    return { affected };
   },
 
   async deleteRoast(roastId) {
     const existing = get().roasts.find((roast) => roast.id === roastId);
-    if (!existing) return;
+    if (!existing) return { affected: 0 };
+    const batchId = existing.batchId;
     await removeRoastRow(roastId);
-    const rest = await listRoastsByBatch(existing.batchId);
+    const rest = await listRoastsByBatch(batchId);
     if (rest.length > 0) {
       await putRoasts(rest.map((roast, index) => ({ ...roast, passNo: index + 1, updatedAt: nowIso() })));
     }
+    const affected = await invalidateReviewsForBatches([batchId], '焙火道次删除，审评待复评');
     await get().loadRoasts();
+    return { affected };
   },
 
   async advanceRoastState(roastId) {
