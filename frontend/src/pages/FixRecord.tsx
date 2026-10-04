@@ -30,7 +30,7 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { useGardenStore } from '../stores/gardenStore';
 import { filterFixes, useBatchStore } from '../stores/batchStore';
-import { db } from '../utils/db';
+import { db, invalidateReviewsForBatches } from '../utils/db';
 import { FIX_LIMITS, ROLL_PRESSURE_OPTIONS, type Fix, type FixDraft } from '../types/fix';
 import { batchLabel, judgeFixLevel, roundTo } from '../utils/tea';
 
@@ -120,9 +120,12 @@ export default function FixRecord() {
       if (editingFix) {
         await fixesTable.update(editingFix.id, values);
         message.success('杀青揉捻记录已更新');
+        // 锅温 / 时长 / 揉捻参数或所属批次一变，新旧批次的审评都失效待复评
+        await invalidateReviewsForBatches([...new Set([editingFix.batchId, values.batchId])], '杀青揉捻参数已变');
       } else {
         await fixesTable.create(values);
         message.success('杀青揉捻记录已登记');
+        await invalidateReviewsForBatches([values.batchId], '杀青揉捻参数已变');
       }
       const nextState = await markBatchState(values.batchId, '已杀青');
       if (nextState) {
@@ -147,7 +150,9 @@ export default function FixRecord() {
       onOk: async () => {
         try {
           await fixesTable.remove(fix.id);
-          message.success('记录已删除');
+          // 杀青记录删除属于工艺变更，相关批次审评失效待复评
+          await invalidateReviewsForBatches([fix.batchId], '杀青揉捻参数已变');
+          message.success('记录已删除，相关审评已标记待复评');
         } catch (error) {
           message.error(error instanceof Error ? error.message : '删除失败');
         }

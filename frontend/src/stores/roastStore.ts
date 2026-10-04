@@ -9,6 +9,7 @@ import type { Garden } from '../types/garden';
 import {
   ID_PREFIX,
   createId,
+  invalidateReviewsForBatches,
   listRoasts,
   listRoastsByBatch,
   nowIso,
@@ -106,6 +107,8 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
     };
     await putRoast(row);
     await get().loadRoasts();
+    // 焙火参数（温度 / 时长 / 炭种）新增即影响品质，相关审评失效待复评
+    await invalidateReviewsForBatches([draft.batchId], '焙火参数已变');
     return row;
   },
 
@@ -123,6 +126,8 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
     };
     await putRoast(next);
     await get().loadRoasts();
+    // 换批次 / 改焙火参数时，新旧两个批次的审评都需复评
+    await invalidateReviewsForBatches([...new Set([existing.batchId, draft.batchId])], '焙火参数已变');
   },
 
   async deleteRoast(roastId) {
@@ -134,6 +139,7 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
       await putRoasts(rest.map((roast, index) => ({ ...roast, passNo: index + 1, updatedAt: nowIso() })));
     }
     await get().loadRoasts();
+    await invalidateReviewsForBatches([existing.batchId], '焙火参数已变');
   },
 
   async advanceRoastState(roastId) {
@@ -165,6 +171,8 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
     swapped[swapIndex] = current;
     await putRoasts(swapped.map((roast, order) => ({ ...roast, passNo: order + 1, updatedAt: nowIso() })));
     await get().loadRoasts();
+    // 道次顺序变化即焙火曲线变化，相关审评失效待复评
+    await invalidateReviewsForBatches([existing.batchId], '焙火参数已变');
   },
 
   async reorderPasses(batchId, orderedIds) {
@@ -180,6 +188,7 @@ export const useRoastStore = create<RoastStoreState>((set, get) => ({
       .map((roast, index) => ({ ...roast, passNo: index + 1, updatedAt: nowIso() }));
     await putRoasts(reordered);
     await get().loadRoasts();
+    await invalidateReviewsForBatches([batchId], '焙火参数已变');
   },
 }));
 

@@ -178,14 +178,14 @@ export default function TurnBoard() {
   const confirmDelete = (turn: Turn): void => {
     modal.confirm({
       title: `删除第 ${turn.roundNo} 轮？`,
-      content: '删除后其余轮次会自动重排 roundNo，做青时间线与累计时长随之更新。',
+      content: '删除后其余轮次会自动重排 roundNo，做青时间线与累计时长随之更新；该批次审评将因做青参数变化失效待复评。',
       okText: '确认删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
         try {
           await deleteTurn(turn.id);
-          message.success('轮次已删除并重排');
+          message.success('轮次已删除并重排，相关审评已标记待复评');
         } catch (error) {
           message.error(error instanceof Error ? error.message : '删除失败');
         }

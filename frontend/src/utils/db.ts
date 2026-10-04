@@ -1,7 +1,9 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）· 库名 gbtearock
- * - 结构版本号 version(1) 初版 + version(DB_VERSION=2) 升级迁移（真实改写历史数据）
- * - 山场 / 茶青批次 / 做青轮次 / 杀青揉捻 / 焙火 / 审评 六张分表存储
+ * - 结构版本号 version(1) 初版 + version(2) 索引补齐与历史数据迁移 + version(3) 可恢复归档与审评复评
+ * - 山场 / 茶青批次 / 做青轮次 / 杀青揉捻 / 焙火 / 审评 六张正式分表 + archives 回收区表
+ * - 山场 / 批次移走时六表关联记录整体归档（保留原顺序与引用），可恢复；回收区 300 条明细封顶
+ * - 做青 / 杀青 / 焙火参数一变，相关审评与拼配候选失效待复评
  * - 首屏自动播种互相引用的演示数据（山场 → 批次 → 轮次/杀青/焙火/审评 三层贯通）
  * - 纯前端应用：不依赖任何后端、数据库服务或外部接口
  */
@@ -11,14 +13,26 @@ import { BATCH_STATES, type Batch } from '../types/batch';
 import { TURN_LIMITS, type Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
 import { ROAST_STATES, type Roast } from '../types/roast';
-import type { Review } from '../types/review';
+import type { Review, ReviewStaleReason } from '../types/review';
+import {
+  ARCHIVE_DETAIL_CAP,
+  ARCHIVE_TABLES,
+  type ArchiveGroupSummary,
+  type ArchiveKind,
+  type ArchiveRecord,
+  type ArchiveTable,
+  type RestoreChoice,
+  type RestorePlan,
+  type RestoreResult,
+} from '../types/archive';
 import { clampScore, weightedTotalScore } from './tea';
+import { buildProcessFingerprint, markReviewStale } from './process';
 
 /** 数据库名 = 英文短名 */
 export const DB_NAME = 'gbtearock';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 主键前缀，便于在导出 JSON 里肉眼区分实体 */
 export const ID_PREFIX = {
@@ -28,6 +42,7 @@ export const ID_PREFIX = {
   fix: 'fix',
   roast: 'roast',
   review: 'review',
+  archive: 'arch',
 } as const;
 
 class TeaRockDatabase extends Dexie {
@@ -37,6 +52,7 @@ class TeaRockDatabase extends Dexie {
   fixes!: Table<Fix, string>;
   roasts!: Table<Roast, string>;
   reviews!: Table<Review, string>;
+  archives!: Table<ArchiveRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -55,7 +71,7 @@ class TeaRockDatabase extends Dexie {
     //     1) 补齐 createdAt / updatedAt；2) 山场补齐朝向、土壤与品种兜底值；
     //     3) 批次工序状态归一化；4) 轮次与焙火数值截断到合法区间；
     //     5) 审评总分由「四项简单平均」改为「分项加权换算」，迁移时按新权重重算。
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         gardens: 'id, name, cultivar, soil, altitudeM, createdAt, updatedAt',
         batches: 'id, gardenId, pickedAt, state, tenderness, createdAt, updatedAt',
@@ -152,6 +168,60 @@ class TeaRockDatabase extends Dexie {
               taste: row.taste,
               leafBase: row.leafBase,
             });
+          });
+      });
+
+    // v3：可恢复归档 + 审评复评失效
+    //     1) 新增 archives 回收区表（按归档组归档、保留顺序与引用、300 条明细封顶）；
+    //     2) 审评补齐 stale / staleReason / staleAt / processFingerprint，
+    //        旧库历史审评按当时工艺快照回填指纹，视为当前有效；
+    //     3) 指纹回填需要同批次做青 / 杀青 / 焙火数据，全部在升级事务内读取。
+    this.version(DB_VERSION)
+      .stores({
+        gardens: 'id, name, cultivar, soil, altitudeM, createdAt, updatedAt',
+        batches: 'id, gardenId, pickedAt, state, tenderness, createdAt, updatedAt',
+        turns: 'id, batchId, roundNo, [batchId+roundNo], createdAt, updatedAt',
+        fixes: 'id, batchId, operator, createdAt, updatedAt',
+        roasts: 'id, batchId, passNo, state, nextRoastDate, createdAt, updatedAt',
+        reviews: 'id, batchId, reviewedAt, totalScore, stale, createdAt, updatedAt',
+        archives: 'id, archiveGroupId, kind, table, archivedAt',
+      })
+      .upgrade(async (tx) => {
+        const stamp = nowIso();
+
+        // 先把六张正式表读全，供审评历史指纹回填
+        const [allTurns, allFixes, allRoasts] = await Promise.all([
+          tx.table<Turn, string>('turns').toArray(),
+          tx.table<Fix, string>('fixes').toArray(),
+          tx.table<Roast, string>('roasts').toArray(),
+        ]);
+        const turnsByBatch = new Map<string, Turn[]>();
+        allTurns.forEach((turn) => {
+          turnsByBatch.set(turn.batchId, [...(turnsByBatch.get(turn.batchId) ?? []), turn]);
+        });
+        const roastsByBatch = new Map<string, Roast[]>();
+        allRoasts.forEach((roast) => {
+          roastsByBatch.set(roast.batchId, [...(roastsByBatch.get(roast.batchId) ?? []), roast]);
+        });
+        const fixByBatch = new Map<string, Fix>();
+        allFixes.forEach((fix) => fixByBatch.set(fix.batchId, fix));
+
+        await tx
+          .table<Review, string>('reviews')
+          .toCollection()
+          .modify((row) => {
+            // 旧库升级：补齐归档 / 复评字段，历史审评按当时工艺快照回填指纹（视为有效）
+            if (typeof row.stale !== 'boolean') row.stale = false;
+            if (typeof row.staleReason !== 'string') row.staleReason = '';
+            if (typeof row.staleAt !== 'string') row.staleAt = '';
+            if (typeof row.processFingerprint !== 'string' || !row.processFingerprint) {
+              row.processFingerprint = buildProcessFingerprint({
+                turns: turnsByBatch.get(row.batchId) ?? [],
+                fix: fixByBatch.get(row.batchId),
+                roasts: roastsByBatch.get(row.batchId) ?? [],
+              });
+            }
+            row.updatedAt = row.updatedAt || stamp;
           });
       });
   }
@@ -385,7 +455,7 @@ export async function seedDatabase(): Promise<void> {
     },
   ];
 
-  const reviewSeed: Array<Omit<Review, 'totalScore'>> = [
+  const reviewSeed: Array<Omit<Review, 'totalScore' | 'stale' | 'staleReason' | 'staleAt' | 'processFingerprint'>> = [
     {
       id: 'review-niulankeng',
       batchId: 'batch-niulankeng-0426',
@@ -423,17 +493,28 @@ export async function seedDatabase(): Promise<void> {
       updatedAt: stamp,
     },
   ];
-  const reviews: Review[] = reviewSeed.map((row) => ({
-    ...row,
-    totalScore: weightedTotalScore({
-      aroma: row.aroma,
-      liquorColor: row.liquorColor,
-      taste: row.taste,
-      leafBase: row.leafBase,
-    }),
-  }));
+  const reviews: Review[] = reviewSeed.map((row) => {
+    const fingerprint = buildProcessFingerprint({
+      turns: turns.filter((turn) => turn.batchId === row.batchId),
+      fix: fixes.find((fix) => fix.batchId === row.batchId),
+      roasts: roasts.filter((roast) => roast.batchId === row.batchId),
+    });
+    return {
+      ...row,
+      totalScore: weightedTotalScore({
+        aroma: row.aroma,
+        liquorColor: row.liquorColor,
+        taste: row.taste,
+        leafBase: row.leafBase,
+      }),
+      stale: false,
+      staleReason: '',
+      staleAt: '',
+      processFingerprint: fingerprint,
+    };
+  });
 
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
+  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.archives], async () => {
     if ((await db.gardens.count()) === 0) await db.gardens.bulkPut(gardens);
     if ((await db.batches.count()) === 0) await db.batches.bulkPut(batches);
     if ((await db.turns.count()) === 0) await db.turns.bulkPut(turns);
@@ -484,20 +565,67 @@ export async function putGarden(row: Garden): Promise<void> {
   await db.gardens.put(row);
 }
 
-/** 删除山场：级联删除其批次及批次下的轮次 / 杀青 / 焙火 / 审评 */
+/**
+ * 移走山场（可恢复归档）：把山场及其批次、批次下的轮次 / 杀青 / 焙火 / 审评
+ * 整体放入回收区同一归档组，保留原 roundNo / passNo 顺序与外键引用。
+ * 回收区明细达到 ARCHIVE_DETAIL_CAP（300）时拒绝移入并抛错，事务整体回滚。
+ */
 export async function removeGarden(id: string): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    const batches = await db.batches.where('gardenId').equals(id).toArray();
-    const batchIds = batches.map((batch) => batch.id);
-    if (batchIds.length > 0) {
-      await db.turns.where('batchId').anyOf(batchIds).delete();
-      await db.fixes.where('batchId').anyOf(batchIds).delete();
-      await db.roasts.where('batchId').anyOf(batchIds).delete();
-      await db.reviews.where('batchId').anyOf(batchIds).delete();
-      await db.batches.where('gardenId').equals(id).delete();
-    }
-    await db.gardens.delete(id);
-  });
+  const garden = await db.gardens.get(id);
+  if (!garden) return;
+  const stamp = nowIso();
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.archives],
+    async () => {
+      const batches = await db.batches.where('gardenId').equals(id).toArray();
+      const batchIds = batches.map((batch) => batch.id);
+      const [turns, fixes, roasts, reviews] = await Promise.all([
+        batchIds.length > 0 ? db.turns.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([]),
+        batchIds.length > 0 ? db.fixes.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([]),
+        batchIds.length > 0 ? db.roasts.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([]),
+        batchIds.length > 0 ? db.reviews.where('batchId').anyOf(batchIds).toArray() : Promise.resolve([]),
+      ]);
+
+      // 顺序：山场 → 批次（采摘日倒序）→ 各子表按原 roundNo / passNo / 日期排列
+      const orderedBatches = [...batches].sort((a, b) => b.pickedAt.localeCompare(a.pickedAt));
+      const rowsForBatch = (batchId: string) => ({
+        turns: turns.filter((row) => row.batchId === batchId).sort((a, b) => a.roundNo - b.roundNo),
+        fix: fixes.filter((row) => row.batchId === batchId),
+        roasts: roasts.filter((row) => row.batchId === batchId).sort((a, b) => a.passNo - b.passNo),
+        reviews: reviews
+          .filter((row) => row.batchId === batchId)
+          .sort((a, b) => a.reviewedAt.localeCompare(b.reviewedAt)),
+      });
+
+      const groupId = createId(ID_PREFIX.archive);
+      const records: ArchiveRecord[] = [];
+      const push = (table: ArchiveTable, payload: unknown, seq: number): void => {
+        records.push(buildArchiveRow({ groupId, kind: 'garden', table, payload, seq, rootLabel: garden.name, stamp }));
+      };
+      push('gardens', garden, 0);
+      let seq = 1;
+      orderedBatches.forEach((batch) => {
+        push('batches', batch, seq++);
+        const branch = rowsForBatch(batch.id);
+        branch.turns.forEach((row) => push('turns', row, seq++));
+        branch.fix.forEach((row) => push('fixes', row, seq++));
+        branch.roasts.forEach((row) => push('roasts', row, seq++));
+        branch.reviews.forEach((row) => push('reviews', row, seq++));
+      });
+
+      await assertArchiveCapacity(records.length);
+      await db.archives.bulkAdd(records);
+      await Promise.all([
+        db.turns.bulkDelete(turns.map((row) => row.id)),
+        db.fixes.bulkDelete(fixes.map((row) => row.id)),
+        db.roasts.bulkDelete(roasts.map((row) => row.id)),
+        db.reviews.bulkDelete(reviews.map((row) => row.id)),
+        db.batches.bulkDelete(batchIds),
+        db.gardens.delete(id),
+      ]);
+    },
+  );
 }
 
 /* ------------------------------ 茶青批次 ------------------------------ */
@@ -524,15 +652,56 @@ export async function putBatches(rows: Batch[]): Promise<void> {
   await db.batches.bulkPut(rows);
 }
 
-/** 删除批次：级联删除轮次 / 杀青 / 焙火 / 审评 */
+/**
+ * 移走批次（可恢复归档）：把批次及其轮次 / 杀青 / 焙火 / 审评
+ * 整体放入回收区同一归档组，保留原 roundNo / passNo 顺序与外键引用。
+ * 回收区明细达到 ARCHIVE_DETAIL_CAP（300）时拒绝移入并抛错，事务整体回滚。
+ */
 export async function removeBatch(id: string): Promise<void> {
-  await db.transaction('rw', db.batches, db.turns, db.fixes, db.roasts, db.reviews, async () => {
-    await db.turns.where('batchId').equals(id).delete();
-    await db.fixes.where('batchId').equals(id).delete();
-    await db.roasts.where('batchId').equals(id).delete();
-    await db.reviews.where('batchId').equals(id).delete();
-    await db.batches.delete(id);
-  });
+  const batch = await db.batches.get(id);
+  if (!batch) return;
+  const garden = await db.gardens.get(batch.gardenId);
+  const rootLabel = garden ? `${garden.name} · ${batch.pickedAt} · ${batch.tenderness}` : `${batch.pickedAt} · ${batch.tenderness}`;
+  const stamp = nowIso();
+  await db.transaction(
+    'rw',
+    [db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.archives],
+    async () => {
+      const [turns, fixes, roasts, reviews] = await Promise.all([
+        db.turns.where('batchId').equals(id).toArray(),
+        db.fixes.where('batchId').equals(id).toArray(),
+        db.roasts.where('batchId').equals(id).toArray(),
+        db.reviews.where('batchId').equals(id).toArray(),
+      ]);
+      const groupId = createId(ID_PREFIX.archive);
+      const records: ArchiveRecord[] = [];
+      const push = (table: ArchiveTable, payload: unknown, seq: number): void => {
+        records.push(buildArchiveRow({ groupId, kind: 'batch', table, payload, seq, rootLabel, stamp }));
+      };
+      push('batches', batch, 0);
+      let seq = 1;
+      [...turns]
+        .sort((a, b) => a.roundNo - b.roundNo)
+        .forEach((row) => push('turns', row, seq++));
+      fixes.forEach((row) => push('fixes', row, seq++));
+      [...roasts]
+        .sort((a, b) => a.passNo - b.passNo)
+        .forEach((row) => push('roasts', row, seq++));
+      [...reviews]
+        .sort((a, b) => a.reviewedAt.localeCompare(b.reviewedAt))
+        .forEach((row) => push('reviews', row, seq++));
+
+      await assertArchiveCapacity(records.length);
+      await db.archives.bulkAdd(records);
+      await Promise.all([
+        db.turns.bulkDelete(turns.map((row) => row.id)),
+        db.fixes.bulkDelete(fixes.map((row) => row.id)),
+        db.roasts.bulkDelete(roasts.map((row) => row.id)),
+        db.reviews.bulkDelete(reviews.map((row) => row.id)),
+        db.batches.delete(id),
+      ]);
+    },
+  );
 }
 
 /* ------------------------------ 做青轮次 ------------------------------ */
@@ -622,6 +791,203 @@ export async function removeReview(id: string): Promise<void> {
   await db.reviews.delete(id);
 }
 
+/* ---------------------------- 可恢复归档（回收区） ---------------------------- */
+
+/** 回收区明细条数（六表归档行合计） */
+export async function countArchiveDetails(): Promise<number> {
+  return db.archives.count();
+}
+
+/** 构造一条归档明细 */
+function buildArchiveRow(params: {
+  groupId: string;
+  kind: ArchiveKind;
+  table: ArchiveTable;
+  payload: unknown;
+  seq: number;
+  rootLabel: string;
+  stamp: string;
+}): ArchiveRecord {
+  return {
+    id: createId(`${ID_PREFIX.archive}-${params.table}`),
+    archiveGroupId: params.groupId,
+    kind: params.kind,
+    rootLabel: params.rootLabel,
+    table: params.table,
+    payload: params.payload as Record<string, unknown>,
+    seq: params.seq,
+    archivedAt: params.stamp,
+    createdAt: params.stamp,
+    updatedAt: params.stamp,
+  };
+}
+
+/** 容量闸门：现有明细 + 本次明细超过 300 条即拒绝移入 */
+async function assertArchiveCapacity(incoming: number): Promise<void> {
+  const current = await db.archives.count();
+  if (current + incoming > ARCHIVE_DETAIL_CAP) {
+    throw new Error(
+      `回收区容量 ${ARCHIVE_DETAIL_CAP} 条明细已满（现有 ${current} 条，本次需移入 ${incoming} 条），请先清理回收区再移走`,
+    );
+  }
+}
+
+/** 空计数模板 */
+function emptyTableCounts(): Record<ArchiveTable, number> {
+  return ARCHIVE_TABLES.reduce((acc, table) => {
+    acc[table] = 0;
+    return acc;
+  }, {} as Record<ArchiveTable, number>);
+}
+
+/** 回收区分组列表（按归档时间倒序） */
+export async function listArchiveGroups(): Promise<ArchiveGroupSummary[]> {
+  const rows = await db.archives.toArray();
+  const map = new Map<string, ArchiveGroupSummary>();
+  rows.forEach((row) => {
+    let group = map.get(row.archiveGroupId);
+    if (!group) {
+      group = {
+        archiveGroupId: row.archiveGroupId,
+        kind: row.kind,
+        rootLabel: row.rootLabel,
+        archivedAt: row.archivedAt,
+        counts: emptyTableCounts(),
+        detailCount: 0,
+      };
+      map.set(row.archiveGroupId, group);
+    }
+    group.counts[row.table] += 1;
+    group.detailCount += 1;
+    // 组内取最新归档时间与组名（rootLabel 组内一致）
+    if (row.archivedAt > group.archivedAt) group.archivedAt = row.archivedAt;
+  });
+  return [...map.values()].sort((a, b) => b.archivedAt.localeCompare(a.archivedAt));
+}
+
+/** 取一个归档组的全部明细（按组内 seq 升序，即原顺序回放） */
+export async function getArchiveGroup(groupId: string): Promise<ArchiveRecord[]> {
+  const rows = await db.archives.where('archiveGroupId').equals(groupId).toArray();
+  return rows.sort((a, b) => a.seq - b.seq);
+}
+
+/** 各归档明细对应的正式表（按表名索引） */
+const LIVE_TABLE_OF: Record<ArchiveTable, Table<{ id: string }, string>> = {
+  gardens: db.gardens,
+  batches: db.batches,
+  turns: db.turns,
+  fixes: db.fixes,
+  roasts: db.roasts,
+  reviews: db.reviews,
+};
+
+/**
+ * 恢复预检：读取归档组，找出正式表中同编号（同主键）已存在的明细。
+ * 冲突项默认「保留现网」，由 UI 列出新旧工艺供人取舍后再调 restoreArchiveGroup。
+ */
+export async function planRestoreArchive(groupId: string): Promise<RestorePlan> {
+  const records = await getArchiveGroup(groupId);
+  const conflicts = await Promise.all(
+    records.map(async (record) => {
+      const live = (await LIVE_TABLE_OF[record.table].get(String(record.payload.id))) as
+        | Record<string, unknown>
+        | undefined;
+      return live ? { record, live } : null;
+    }),
+  );
+  return {
+    archiveGroupId: groupId,
+    records,
+    conflicts: conflicts
+      .filter((item): item is { record: ArchiveRecord; live: Record<string, unknown> } => item !== null)
+      .map(({ record, live }) => ({
+        archiveId: record.id,
+        table: record.table,
+        archived: record.payload,
+        live,
+        choice: 'keep-live' as RestoreChoice,
+      })),
+  };
+}
+
+/**
+ * 执行恢复（单事务）：
+ * - 无冲突或取舍为「用归档覆盖」的明细，按组内顺序写回正式表并从回收区移除；
+ * - 取舍为「保留现网」的明细不动（继续留在回收区），不覆盖现有记录；
+ * - 中途任一步失败，事务回滚到恢复操作前状态，回收区与正式数据都保持可继续处理。
+ */
+export async function restoreArchiveGroup(
+  groupId: string,
+  choices: Record<string, RestoreChoice>,
+): Promise<RestoreResult> {
+  return db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.archives],
+    async () => {
+      const records = await getArchiveGroup(groupId);
+      let restored = 0;
+      let conflictKept = 0;
+      for (const record of records) {
+        const choice = choices[record.id] ?? 'keep-live';
+        const exists = (await LIVE_TABLE_OF[record.table].get(String(record.payload.id))) !== undefined;
+        if (exists && choice === 'keep-live') {
+          conflictKept += 1;
+          continue;
+        }
+        await LIVE_TABLE_OF[record.table].put(record.payload as never);
+        await db.archives.delete(record.id);
+        restored += 1;
+      }
+      return { restored, conflictKept };
+    },
+  );
+}
+
+/** 永久删除整个归档组（清理回收区，不可恢复） */
+export async function purgeArchiveGroup(groupId: string): Promise<void> {
+  await db.archives.where('archiveGroupId').equals(groupId).delete();
+}
+
+/** 清空回收区（清理，不可恢复） */
+export async function purgeAllArchives(): Promise<void> {
+  await db.archives.clear();
+}
+
+/* ------------------------ 审评失效联动（工艺参数变更） ------------------------ */
+
+/**
+ * 做青 / 杀青 / 焙火参数一变：把相关批次的有效审评标记为待复评。
+ * 已失效且原因相同的审评不重复刷新；与参数写入放在同一调用链（各 store 的写事务之后）。
+ */
+export async function invalidateReviewsForBatches(
+  batchIds: string[],
+  reason: Exclude<ReviewStaleReason, ''>,
+): Promise<number> {
+  const ids = [...new Set(batchIds)].filter(Boolean);
+  if (ids.length === 0) return 0;
+  const stamp = nowIso();
+  let affected = 0;
+  await db.transaction('rw', db.reviews, async () => {
+    const reviews = await db.reviews.where('batchId').anyOf(ids).toArray();
+    const next = reviews
+      .filter((review) => !(review.stale && review.staleReason === reason))
+      .map((review) => markReviewStale(review, reason, stamp));
+    affected = next.length;
+    if (next.length > 0) await db.reviews.bulkPut(next);
+  });
+  return affected;
+}
+
+/** 计算某批次当前工艺指纹（审评复评登记时写入快照） */
+export async function fingerprintOfBatch(batchId: string): Promise<string> {
+  const [turns, fixes, roasts] = await Promise.all([
+    db.turns.where('batchId').equals(batchId).toArray(),
+    db.fixes.where('batchId').equals(batchId).toArray(),
+    db.roasts.where('batchId').equals(batchId).toArray(),
+  ]);
+  return buildProcessFingerprint({ turns, fix: fixes[0], roasts });
+}
+
 /* ---------------------------- 整库导入导出 ---------------------------- */
 
 /** 整库快照（导出 / 导入 JSON 的结构） */
@@ -635,53 +1001,82 @@ export interface DatabaseSnapshot {
   fixes: Fix[];
   roasts: Roast[];
   reviews: Review[];
+  /** 回收区归档明细（旧版存档缺省时按空回收区处理） */
+  archives: ArchiveRecord[];
 }
 
-/** 导出整库快照 */
+/** 导出整库快照（含回收区，避免导出再导入把可恢复数据丢掉） */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, archives] = await Promise.all([
     db.gardens.toArray(),
     db.batches.toArray(),
     db.turns.toArray(),
     db.fixes.toArray(),
     db.roasts.toArray(),
     db.reviews.toArray(),
+    db.archives.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_VERSION, exportedAt: nowIso(), gardens, batches, turns, fixes, roasts, reviews };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_VERSION,
+    exportedAt: nowIso(),
+    gardens,
+    batches,
+    turns,
+    fixes,
+    roasts,
+    reviews,
+    archives,
+  };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/**
+ * 用快照覆盖整库（导入存档）。
+ * 正式六表被存档覆盖；回收区按存档内容回放（旧版存档没有 archives 字段则清空回收区，
+ * 因为旧备份不包含任何可恢复对象）。全部在同一事务内，失败回滚。
+ */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    await Promise.all([
-      db.gardens.clear(),
-      db.batches.clear(),
-      db.turns.clear(),
-      db.fixes.clear(),
-      db.roasts.clear(),
-      db.reviews.clear(),
-    ]);
-    await db.gardens.bulkPut(snapshot.gardens);
-    await db.batches.bulkPut(snapshot.batches);
-    await db.turns.bulkPut(snapshot.turns);
-    await db.fixes.bulkPut(snapshot.fixes);
-    await db.roasts.bulkPut(snapshot.roasts);
-    await db.reviews.bulkPut(snapshot.reviews);
-  });
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.archives],
+    async () => {
+      await Promise.all([
+        db.gardens.clear(),
+        db.batches.clear(),
+        db.turns.clear(),
+        db.fixes.clear(),
+        db.roasts.clear(),
+        db.reviews.clear(),
+        db.archives.clear(),
+      ]);
+      await db.gardens.bulkPut(snapshot.gardens);
+      await db.batches.bulkPut(snapshot.batches);
+      await db.turns.bulkPut(snapshot.turns);
+      await db.fixes.bulkPut(snapshot.fixes);
+      await db.roasts.bulkPut(snapshot.roasts);
+      await db.reviews.bulkPut(snapshot.reviews);
+      if (snapshot.archives.length > 0) await db.archives.bulkPut(snapshot.archives);
+    },
+  );
 }
 
-/** 清空全部表（不重新播种） */
+/** 清空全部正式表与回收区（不重新播种） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    await Promise.all([
-      db.gardens.clear(),
-      db.batches.clear(),
-      db.turns.clear(),
-      db.fixes.clear(),
-      db.roasts.clear(),
-      db.reviews.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.archives],
+    async () => {
+      await Promise.all([
+        db.gardens.clear(),
+        db.batches.clear(),
+        db.turns.clear(),
+        db.fixes.clear(),
+        db.roasts.clear(),
+        db.reviews.clear(),
+        db.archives.clear(),
+      ]);
+    },
+  );
 }
 
 /** 清空全部数据并重新灌入演示数据 */
@@ -692,13 +1087,14 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数概览（页脚与统计徽标使用） */
 export async function countAll(): Promise<Record<string, number>> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, archives] = await Promise.all([
     db.gardens.count(),
     db.batches.count(),
     db.turns.count(),
     db.fixes.count(),
     db.roasts.count(),
     db.reviews.count(),
+    db.archives.count(),
   ]);
-  return { gardens, batches, turns, fixes, roasts, reviews };
+  return { gardens, batches, turns, fixes, roasts, reviews, archives };
 }

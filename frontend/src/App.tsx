@@ -114,6 +114,7 @@ export default function App() {
             <div>山场 {counts.gardens ?? 0} · 批次 {counts.batches ?? 0}</div>
             <div>轮次 {counts.turns ?? 0} · 杀青 {counts.fixes ?? 0}</div>
             <div>焙火 {counts.roasts ?? 0} · 审评 {counts.reviews ?? 0}</div>
+            <div>回收区 {counts.archives ?? 0} / 300 条明细</div>
           </div>
         </Sider>
 

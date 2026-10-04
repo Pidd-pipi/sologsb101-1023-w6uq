@@ -189,14 +189,14 @@ export default function RoastPlan() {
   const confirmDelete = (roast: Roast): void => {
     modal.confirm({
       title: `删除第 ${roast.passNo} 道焙火？`,
-      content: `批次：${labelOfBatch(roast.batchId)}。删除后同批次其余道次会重排 passNo。`,
+      content: `批次：${labelOfBatch(roast.batchId)}。删除后同批次其余道次会重排 passNo，相关审评将失效待复评。`,
       okText: '确认删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
         try {
           await deleteRoast(roast.id);
-          message.success('焙火道次已删除并重排');
+          message.success('焙火道次已删除并重排，相关审评已标记待复评');
         } catch (error) {
           message.error(error instanceof Error ? error.message : '删除失败');
         }

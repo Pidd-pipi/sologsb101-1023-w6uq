@@ -11,6 +11,7 @@ import type { Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
 import type { Roast } from '../types/roast';
 import type { Review } from '../types/review';
+import type { ArchiveRecord } from '../types/archive';
 import { DB_NAME, DB_VERSION, type DatabaseSnapshot } from './db';
 import { batchLabel, isRatioValid, roundTo } from './tea';
 
@@ -133,6 +134,23 @@ function assertRows(value: unknown, table: string): void {
   });
 }
 
+/** 校验归档明细：必须是数组，每行带 id / 归档组 / 来源表 / 原始快照 */
+function assertArchiveRows(value: unknown): ArchiveRecord[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error('存档「archives」回收区数据格式不是数组');
+  }
+  return value.map((row, index) => {
+    if (!isRecord(row) || typeof row.id !== 'string' || !row.id) {
+      throw new Error(`「archives」第 ${index + 1} 行缺少 id`);
+    }
+    if (typeof row.archiveGroupId !== 'string' || typeof row.table !== 'string' || !isRecord(row.payload)) {
+      throw new Error(`「archives」第 ${index + 1} 行缺少归档组 / 来源表 / 原始快照`);
+    }
+    return row as unknown as ArchiveRecord;
+  });
+}
+
 /**
  * 解析并校验整库存档 JSON 文本；校验失败抛出带中文说明的 Error。
  */
@@ -165,6 +183,7 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
     fixes: raw.fixes as DatabaseSnapshot['fixes'],
     roasts: raw.roasts as DatabaseSnapshot['roasts'],
     reviews: raw.reviews as DatabaseSnapshot['reviews'],
+    archives: assertArchiveRows(raw.archives),
   };
 }
 

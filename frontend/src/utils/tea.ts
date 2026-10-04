@@ -358,11 +358,12 @@ export function matchScoreBand(score: number, bandKeys: string[]): boolean {
 
 /* ----------------------------- 拼配候选 ----------------------------- */
 
-/** 按总分由高到低生成拼配候选清单 */
+/** 按总分由高到低生成拼配候选清单（工艺已变、待复评的失效审评不进入候选） */
 export function buildBlendCandidates(reviews: Review[], batches: Batch[], gardens: Garden[]): BlendCandidate[] {
   const batchMap = new Map(batches.map((batch) => [batch.id, batch]));
   const gardenMap = new Map(gardens.map((garden) => [garden.id, garden]));
   return reviews
+    .filter((review) => review.stale !== true)
     .filter((review) => batchMap.has(review.batchId))
     .map((review) => {
       const batch = batchMap.get(review.batchId) as Batch;
@@ -377,6 +378,8 @@ export function buildBlendCandidates(reviews: Review[], batches: Batch[], garden
         totalScore: review.totalScore,
         state: batch.state,
         pickedAt: batch.pickedAt,
+        stale: review.stale === true,
+        staleReason: review.staleReason ?? '',
       };
     })
     .sort((a, b) => b.totalScore - a.totalScore);

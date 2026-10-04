@@ -63,7 +63,10 @@ interface GardenStoreState {
 /** 依据山场 / 批次 / 审评计算指标 */
 async function buildMetrics(gardens: Garden[]): Promise<{ metrics: Record<string, GardenMetrics> }> {
   const [batches, reviews] = await Promise.all([listBatches(), listReviews()]);
-  const scoreByBatch = new Map(reviews.map((review) => [review.batchId, review.totalScore]));
+  // 工艺变更后待复评的失效审评不参与山场均分
+  const scoreByBatch = new Map(
+    reviews.filter((review) => review.stale !== true).map((review) => [review.batchId, review.totalScore]),
+  );
   const metrics: Record<string, GardenMetrics> = {};
   const scoresByGarden: Record<string, number[]> = {};
 

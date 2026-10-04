@@ -7,6 +7,7 @@
 import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
+  Alert,
   App,
   Button,
   Card,
@@ -33,7 +34,8 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { useGardenStore } from '../stores/gardenStore';
 import { filterReviews, useBatchStore } from '../stores/batchStore';
-import { db } from '../utils/db';
+import { createId, db, fingerprintOfBatch } from '../utils/db';
+import { markReviewFresh } from '../utils/process';
 import {
   BLEND_CANDIDATE_SCORE,
   REVIEW_SCORE_LABEL,
@@ -43,6 +45,7 @@ import {
 } from '../types/review';
 import { ROUTES } from '../router';
 import { SCORE_BANDS, averageScore, batchLabel, roundTo, scoreGrade, todayIso, weightedTotalScore } from '../utils/tea';
+import { staleReasonText } from '../utils/process';
 
 /** 空表单默认分项打分 */
 const EMPTY_SCORES = { aroma: 88, liquorColor: 86, taste: 87, leafBase: 84 };
@@ -82,13 +85,15 @@ export default function ReviewBoard() {
   );
 
   const stats = useMemo(() => {
-    const scores = rows.map((review) => review.totalScore);
-    const candidates = rows.filter((review) => review.totalScore >= BLEND_CANDIDATE_SCORE).length;
-    const best = scores.length > 0 ? Math.max(...scores) : 0;
+    const validRows = rows.filter((review) => review.stale !== true);
+    const candidates = validRows.filter((review) => review.totalScore >= BLEND_CANDIDATE_SCORE).length;
+    const staleCount = rows.filter((review) => review.stale === true).length;
+    const best = validRows.length > 0 ? Math.max(...validRows.map((review) => review.totalScore)) : 0;
     return {
-      average: averageScore(scores),
+      average: averageScore(validRows.map((review) => review.totalScore)),
       best,
       candidates,
+      staleCount,
       batchCovered: new Set(rows.map((review) => review.batchId)).size,
     };
   }, [rows]);
@@ -145,22 +150,31 @@ export default function ReviewBoard() {
       taste: values.taste,
       leafBase: values.leafBase,
     });
-    const payload: Omit<Review, 'id' | 'createdAt' | 'updatedAt'> = {
-      batchId: values.batchId,
-      reviewedAt: values.reviewedAt,
-      aroma: values.aroma,
-      liquorColor: values.liquorColor,
-      taste: values.taste,
-      leafBase: values.leafBase,
-      totalScore,
-      blendNote: values.blendNote ?? '',
-    };
+    // 复评登记：记录当前工艺指纹，审评重新生效（退出待复评）
+    const fingerprint = await fingerprintOfBatch(values.batchId);
+    const stamp = new Date().toISOString();
     try {
       if (editingReview) {
-        await reviewsTable.update(editingReview.id, payload);
-        message.success(`审评记录已更新，加权总分 ${totalScore} 分（${scoreGrade(totalScore)}）`);
+        const fresh = markReviewFresh(
+          { ...editingReview, ...values, totalScore, blendNote: values.blendNote ?? '' },
+          fingerprint,
+          stamp,
+        );
+        await db.reviews.put(fresh);
+        message.success(`审评记录已复评更新，加权总分 ${totalScore} 分（${scoreGrade(totalScore)}），已重新进入拼配候选`);
       } else {
-        await reviewsTable.create(payload);
+        await db.reviews.add({
+          id: createId('review'),
+          ...values,
+          totalScore,
+          blendNote: values.blendNote ?? '',
+          stale: false,
+          staleReason: '',
+          staleAt: '',
+          processFingerprint: fingerprint,
+          createdAt: stamp,
+          updatedAt: stamp,
+        });
         message.success(`审评已登记，加权总分 ${totalScore} 分（${scoreGrade(totalScore)}）`);
       }
       const nextState = await markBatchState(values.batchId, '已审评');
@@ -245,9 +259,17 @@ export default function ReviewBoard() {
     {
       title: '拼配候选',
       key: 'candidate',
-      width: 110,
+      width: 120,
       render: (_: unknown, row) =>
-        row.totalScore >= BLEND_CANDIDATE_SCORE ? <Tag color="volcano">候选</Tag> : <Tag>待复评</Tag>,
+        row.stale ? (
+          <Tooltip title={`${staleReasonText(row)}，复评后重新参与候选`}>
+            <Tag color="red">待复评</Tag>
+          </Tooltip>
+        ) : row.totalScore >= BLEND_CANDIDATE_SCORE ? (
+          <Tag color="volcano">候选</Tag>
+        ) : (
+          <Tag>待复评</Tag>
+        ),
     },
     {
       title: '拼配去向',
@@ -314,8 +336,9 @@ export default function ReviewBoard() {
           value={stats.candidates}
           suffix="款"
           tone="warning"
-          hint={`总分 ≥ ${BLEND_CANDIDATE_SCORE} 分`}
+          hint={`总分 ≥ ${BLEND_CANDIDATE_SCORE} 分；待复评不计入`}
         />
+        <StatBadge label="待复评" value={stats.staleCount} suffix="条" tone="danger" hint="做青 / 杀青 / 焙火参数变更后自动失效" />
         <StatBadge label="覆盖批次" value={stats.batchCovered} suffix="个" />
       </div>
 
@@ -333,6 +356,16 @@ export default function ReviewBoard() {
           </Tooltip>
         }
       />
+
+      {stats.staleCount > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${stats.staleCount} 条审评因做青 / 杀青 / 焙火参数变更已失效（待复评）`}
+          description="失效审评不参与山场均分与拼配候选；在下方列表点「编辑」重新保存即按最新工艺复评生效。"
+        />
+      ) : null}
 
       {reviewsTable.error ? (
         <EmptyPanel size="small" title="本地数据读取失败" description={reviewsTable.error} secondaryText="重试" onSecondary={() => void reviewsTable.refresh()} />

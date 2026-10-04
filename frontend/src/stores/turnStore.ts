@@ -5,7 +5,16 @@
  */
 import { create } from 'zustand';
 import { TURN_LIMITS, type Turn, type TurnDraft, type TurnTemplate } from '../types/turn';
-import { ID_PREFIX, createId, listTurnsByBatch, nowIso, putTurn, putTurns, removeTurn } from '../utils/db';
+import {
+  ID_PREFIX,
+  createId,
+  invalidateReviewsForBatches,
+  listTurnsByBatch,
+  nowIso,
+  putTurn,
+  putTurns,
+  removeTurn,
+} from '../utils/db';
 import { roundTo } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedSelect, type FilterValue } from '../components/common/FilterBar';
 
@@ -171,6 +180,8 @@ export const useTurnStore = create<TurnStoreState>((set, get) => ({
     };
     await putTurn(row);
     await get().loadTurns(draft.batchId);
+    // 做青参数一变，相关审评与拼配候选先失效待复评
+    await invalidateReviewsForBatches([draft.batchId], '做青参数已变');
     return row;
   },
 
@@ -188,6 +199,7 @@ export const useTurnStore = create<TurnStoreState>((set, get) => ({
     };
     await putTurn(next);
     await get().loadTurns(existing.batchId);
+    await invalidateReviewsForBatches([existing.batchId], '做青参数已变');
   },
 
   async deleteTurn(turnId) {
@@ -251,6 +263,8 @@ export const useTurnStore = create<TurnStoreState>((set, get) => ({
       .map((turn, index) => ({ ...turn, roundNo: index + 1, updatedAt: nowIso() }));
     await putTurns(reordered);
     await get().loadTurns(activeBatchId);
+    // 拖拽重排改变做青顺序，相关审评失效待复评
+    await invalidateReviewsForBatches([activeBatchId], '做青参数已变');
   },
 
   async renumber(batchId) {
@@ -258,6 +272,8 @@ export const useTurnStore = create<TurnStoreState>((set, get) => ({
     const renumbered = rows.map((turn, index) => ({ ...turn, roundNo: index + 1, updatedAt: nowIso() }));
     if (renumbered.length > 0) await putTurns(renumbered);
     if (get().activeBatchId === batchId) await get().loadTurns(batchId);
+    // 轮次删除后重排属于做青顺序变化，审评失效待复评
+    await invalidateReviewsForBatches([batchId], '做青参数已变');
   },
 }));
 

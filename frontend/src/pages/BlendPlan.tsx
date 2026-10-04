@@ -4,7 +4,7 @@
  * - 拼配占比校验（合计必须等于 100%），校验通过后可落库写入审评记录的拼配去向
  * - 拼配方案 JSON 导出 + 整库结构版本 JSON 导出（消费 utils/export）
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Alert, App, Button, Card, Col, Divider, Input, InputNumber, Row, Space, Table, Tag, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { ClearOutlined, DownloadOutlined, ExportOutlined, SaveOutlined, ThunderboltOutlined } from '@ant-design/icons';
@@ -56,6 +56,14 @@ export default function BlendPlan() {
     [batches, gardens, reviewsTable.rows],
   );
   const rows = useMemo(() => filterBlendCandidates(candidates, blendFilters), [blendFilters, candidates]);
+
+  // 工艺变更后审评失效：自动从拼配草稿移除已失去候选资格的批次
+  const candidateBatchIds = useMemo(() => new Set(candidates.map((item) => item.batchId)), [candidates]);
+  useEffect(() => {
+    const stalePicked = blendDraft.filter((item) => !candidateBatchIds.has(item.batchId));
+    if (stalePicked.length > 0) setBlendDraft(blendDraft.filter((item) => candidateBatchIds.has(item.batchId)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candidateBatchIds]);
 
   const selectedKeys = useMemo(() => blendDraft.map((item) => item.batchId), [blendDraft]);
   const ratioOf = (batchId: string): number => blendDraft.find((item) => item.batchId === batchId)?.ratioPct ?? 0;

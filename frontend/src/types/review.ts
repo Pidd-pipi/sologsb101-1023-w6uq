@@ -29,6 +29,13 @@ export const REVIEW_SCORE_LABEL: Record<ReviewScoreKey, string> = {
 /** 总分达到该值即进入拼配候选清单 */
 export const BLEND_CANDIDATE_SCORE = 85;
 
+/**
+ * 审评失效原因（做青 / 杀青 / 焙火参数一变即触发失效，待复评）。
+ * '' 表示当前有效（v3 字段补全后的默认状态）。
+ */
+export const REVIEW_STALE_REASONS = ['', '做青参数已变', '杀青揉捻参数已变', '焙火参数已变'] as const;
+export type ReviewStaleReason = (typeof REVIEW_STALE_REASONS)[number];
+
 /** 审评实体（持久化到 IndexedDB 的 reviews 表） */
 export interface Review {
   id: string;
@@ -48,6 +55,17 @@ export interface Review {
   totalScore: number;
   /** 拼配去向，例如「拼配方案 A · 40%」 */
   blendNote: string;
+  /**
+   * 是否待复评：做青 / 杀青 / 焙火参数一变即置为 true，
+   * 期间审评分不参与均分与拼配候选；重新登记 / 编辑审评后置回 false。
+   */
+  stale: boolean;
+  /** 失效原因（stale=true 时有值） */
+  staleReason: ReviewStaleReason;
+  /** 最近一次失效时间 ISO（stale=true 时有值） */
+  staleAt: string;
+  /** 审评登记时该批次的工艺指纹快照，用于判断工艺是否已变 */
+  processFingerprint: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -74,4 +92,7 @@ export interface BlendCandidate {
   totalScore: number;
   state: string;
   pickedAt: string;
+  /** 审评是否已因工艺变更失效（失效项不进入候选清单） */
+  stale: boolean;
+  staleReason: ReviewStaleReason;
 }
